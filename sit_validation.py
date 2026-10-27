@@ -135,6 +135,8 @@ def table_info(fqname):
     info = {}
     for r in rows:
         length = r["character_maximum_length"]
+        if length is not None and (length <= 0 or length >= 2**31 - 1):
+            length = None  # STRING reports 0 (or a huge placeholder): no declared length
         if length is None:
             hit = re.match(r"^(?:var)?char\((\d+)\)$", str(r["full_data_type"]).lower())
             length = int(hit.group(1)) if hit else None
