@@ -102,8 +102,8 @@ CATEGORIES = ["Setup", "Record Count", "Primary Key", "Alternate Key", "Reconcil
 
 
 def record(entity, category, check, ok, expected="", actual="", detail=""):
-    """ok is True, False, or "WARN" (reported but does not fail the run)."""
-    status = "WARN" if ok == "WARN" else ("PASS" if ok else "FAIL")
+    """ok is True, False, "WARN" (reported but does not fail the run) or "SKIP" (entity not checked, does not fail the run)."""
+    status = "WARN" if ok == "WARN" else ("SKIPPED" if ok == "SKIP" else ("PASS" if ok else "FAIL"))
     text = re.sub(r"\s*\n\s*", " ", str(detail))[:500]
     results.append({"entity": entity, "category": category, "check": check, "status": status,
                     "expected": str(expected), "actual": str(actual), "detail": text})
@@ -141,6 +141,16 @@ def load(cfg, layer):
         df = df.filter(flt)
     df.schema  # resolve now, so a missing table or bad filter fails here and not in a later check
     return df
+
+
+NOT_FOUND = re.compile(r"TABLE_OR_VIEW_NOT_FOUND|SCHEMA_NOT_FOUND|CATALOG_NOT_FOUND|NO_SUCH_CATALOG"
+                       r"|cannot be found|does not exist", re.I)
+NO_ACCESS = re.compile(r"PERMISSION_DENIED|INSUFFICIENT_PERMISSIONS", re.I)
+
+
+def is_not_found(e):
+    """True when the error only says a table, schema or catalog does not exist (yet). Access errors are not."""
+    return bool(NOT_FOUND.search(str(e))) and not NO_ACCESS.search(str(e))
 
 
 def tgt_type(df, col):
@@ -528,10 +538,29 @@ for entity in to_run:
     if problems:
         record(entity, "Setup", "Config settings", False, detail="; ".join(problems))
         continue
-    try:
-        dfs = {l: load(cfg, l) for l in LAYERS}
-    except Exception as e:  # table missing, no access, or a bad filter
-        record(entity, "Setup", "Load tables", False, detail=e)
+    # A table that does not exist yet (entity added before its tables) skips the entity; any other error fails it.
+    dfs, found, missing, errors = {}, [], [], []
+    tables = [(l, l.upper(), cfg[l]) for l in LAYERS]
+    tables += [(None, f"{l.upper()} rejects", t) for l, t in cfg.get("rejects", {}).items() if t]
+    for layer, label, name in tables:
+        try:
+            if layer:
+                dfs[layer] = load(cfg, layer)
+            else:
+                spark.table(full_name(name)).schema
+            found.append(label)
+        except Exception as e:  # table missing, no access, or a bad filter
+            if is_not_found(e):
+                missing.append(f"{label} {name}")
+            else:
+                errors.append(f"{label} {name}: {str(e)[:300]}")
+    gone = [f"not found: {', '.join(missing)}"] if missing else []
+    if errors:
+        record(entity, "Setup", "Load tables", False, detail="; ".join(errors + gone))
+        continue
+    if missing:
+        record(entity, "Setup", "Skipped: tables not found", "SKIP",
+               detail=f"{gone[0]}; found: {', '.join(found) or 'none'}; no checks were run for this entity")
         continue
     try:
         info = table_info(cfg["tgt"])
@@ -550,25 +579,28 @@ for entity in to_run:
 
 # COMMAND ----------
 
-STATUS_ORDER = {"FAIL": 0, "WARN": 1, "PASS": 2}
+STATUS_ORDER = {"FAIL": 0, "WARN": 1, "SKIPPED": 2, "PASS": 3}
 run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 run_by = spark.sql("SELECT current_user()").first()[0]
 
 failed = [r for r in results if r["status"] == "FAIL"]
 warned = [r for r in results if r["status"] == "WARN"]
+skipped = [r for r in results if r["status"] == "SKIPPED"]
 
 # One row per entity and category, worst status shown
 rollup = {}
 for r in results:
     row = rollup.setdefault((r["entity"], r["category"]), {
-        "entity": r["entity"], "category": r["category"], "checks": 0, "passed": 0, "failed": 0, "warnings": 0})
+        "entity": r["entity"], "category": r["category"], "checks": 0, "passed": 0, "failed": 0, "warnings": 0,
+        "skipped": 0})
     row["checks"] += 1
-    row[{"PASS": "passed", "FAIL": "failed", "WARN": "warnings"}[r["status"]]] += 1
+    row[{"PASS": "passed", "FAIL": "failed", "WARN": "warnings", "SKIPPED": "skipped"}[r["status"]]] += 1
 summary_rows = list(rollup.values())
 for row in summary_rows:
-    row["status"] = "FAIL" if row["failed"] else ("WARN" if row["warnings"] else "PASS")
+    row["status"] = ("FAIL" if row["failed"] else "WARN" if row["warnings"] else
+                     "SKIPPED" if row["skipped"] else "PASS")
 summary_rows.sort(key=lambda r: (STATUS_ORDER[r["status"]], r["entity"], CATEGORIES.index(r["category"])))
-SUMMARY_COLS = ["entity", "category", "status", "checks", "passed", "failed", "warnings"]
+SUMMARY_COLS = ["entity", "category", "status", "checks", "passed", "failed", "warnings", "skipped"]
 
 # One row per check, failures first
 detail_rows = sorted(results, key=lambda r: (STATUS_ORDER[r["status"]], r["entity"],
@@ -579,8 +611,8 @@ print("Summary by category")
 display(spark.createDataFrame(summary_rows).select(*SUMMARY_COLS))
 print("All checks")
 display(spark.createDataFrame(detail_rows).select(*DETAIL_COLS))
-print(f"{len(results) - len(failed) - len(warned)} passed, {len(failed)} failed, {len(warned)} warnings "
-      f"across {len(to_run)} entity(ies)")
+print(f"{len(results) - len(failed) - len(warned) - len(skipped)} passed, {len(failed)} failed, "
+      f"{len(warned)} warnings, {len(skipped)} skipped across {len(to_run)} entity(ies)")
 
 # COMMAND ----------
 
@@ -616,7 +648,8 @@ if OUTPUT_DIR:
         try:
             run_info = pd.DataFrame([{
                 "run_time_utc": run_time, "run_by": run_by, "entities": ", ".join(to_run), "checks": len(results),
-                "passed": len(results) - len(failed) - len(warned), "failed": len(failed), "warnings": len(warned)}])
+                "passed": len(results) - len(failed) - len(warned) - len(skipped), "failed": len(failed),
+                "warnings": len(warned), "skipped": len(skipped)}])
             xlsx = f"sit_results_{stamp}.xlsx"
             tmp = os.path.join(tempfile.mkdtemp(), xlsx)  # Excel needs random-access writes, so build it locally first
             with pd.ExcelWriter(tmp) as xl:
@@ -637,15 +670,16 @@ if OUTPUT_DIR:
 
 # COMMAND ----------
 
-passed = len(results) - len(failed) - len(warned)
+passed = len(results) - len(failed) - len(warned) - len(skipped)
 setup_failed = [r for r in failed if r["category"] == "Setup"]
-summary_text = (f"SIT completed: {passed} passed, {len(failed)} failed, {len(warned)} warnings "
-                f"across {len(to_run)} entity(ies){export_note}")
+summary_text = (f"SIT completed: {passed} passed, {len(failed)} failed, {len(warned)} warnings, "
+                f"{len(skipped)} skipped across {len(to_run)} entity(ies){export_note}")
 
 # fail_run_on decides whether the job run is marked failed:
 #   never  the run succeeds whatever the checks found (read the results)
 #   setup  the run fails only if something could not run at all (Setup category), not for failed checks
 #   any    the run fails if any check failed
+# SKIPPED entities (tables not created yet) never fail the run.
 if (FAIL_RUN_ON == "any" and failed) or (FAIL_RUN_ON == "setup" and setup_failed):
     raise Exception(f"{summary_text}. See the results tables above.")
 dbutils.notebook.exit(summary_text)

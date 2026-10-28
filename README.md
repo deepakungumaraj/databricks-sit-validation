@@ -11,7 +11,9 @@ Checks, in the order they appear in the results:
 - **Nullability and Defaults**: declared nullability, mandatory columns populated, default values
 - **Data Quality**: your own rules (SQL, accepted values, regex, spaces, not empty, A < B, range)
 - **Audit Columns**: present, populated, not in the future
-- **Setup**: anything that could not run (a missing table, a config mistake, an error in one rule)
+- **Setup**: anything that could not run (a config mistake, no access to a table, an error in one rule), and entities skipped because a table does not exist yet
+
+Each check has a status of `PASS`, `FAIL`, `WARN` (reported, never fails the run) or `SKIPPED`. An entity added to the config before its tables exist is skipped with one `SKIPPED` row that names the missing tables, and the run carries on with the next entity. See [CONFIG.md](CONFIG.md#entities-whose-tables-do-not-exist-yet).
 
 Nothing is saved to Delta tables. Results are shown in the notebook and can be written to CSV and Excel files.
 
@@ -25,7 +27,7 @@ Nothing is saved to Delta tables. Results are shown in the notebook and can be w
 | `output_dir` | A folder of your own for the result files, so `sit_results_latest.csv` is not overwritten by someone else. Leave blank to write nothing |
 | `fail_run_on` | `setup` (default): the run fails only if something could not run. `never`: the run never fails. `any`: the run fails if any check failed |
 
-One or two failed checks are expected in SIT, so by default they do not mark the run as failed. The run ends with a one-line summary such as `SIT completed: 118 passed, 2 failed, 1 warnings across 6 entity(ies)`.
+One or two failed checks are expected in SIT, so by default they do not mark the run as failed. Skipped entities never mark the run as failed, whatever `fail_run_on` is set to. The run ends with a one-line summary such as `SIT completed: 118 passed, 2 failed, 1 warnings, 3 skipped across 6 entity(ies)`.
 
 **Interactively.** Open the notebook, set the same widgets, and run all cells. Each person uses their own config file.
 

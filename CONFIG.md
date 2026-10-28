@@ -48,6 +48,14 @@ Each layer has its own catalog, schema and table, so each is written in full:
 - Always three parts separated by dots. Do not add backticks. The notebook quotes the names itself.
 - The user running the notebook needs read access to all three tables, and to `information_schema` in the TGT catalog.
 
+## Entities whose tables do not exist yet
+You can add an entity to the config before its tables are created. If its RAW, STG or TGT table, or a table named in `rejects`, does not exist (the table, its schema or its catalog cannot be found), the entity is **skipped**:
+- It gets one result row, Setup / *Skipped: tables not found*, with status `SKIPPED`. The `detail` column names each missing table (layer and full name) and lists the tables that were found.
+- No other checks run for that entity, and the notebook carries on with the next one. If every entity is skipped, the run still ends normally.
+- `SKIPPED` is not a failure or a warning, so it never marks the run as failed, whatever `fail_run_on` is set to. Skipped rows are counted separately in the summary (`skipped`).
+- Any other problem loading a table, such as missing permissions or a `filters` expression that does not work, is still a Setup failure (*Load tables*), because it will not fix itself when the table is created.
+- A name in the `entities` widget that is not in the config at all is still a Setup failure (*Unknown entity*), as it is usually a typo.
+
 ## `filters`
 A SQL expression applied to a layer after it is read. Every check for that entity then sees only the filtered rows.
 
@@ -85,7 +93,7 @@ Alternate keys that must also be unique. For each layer, a list of keys, and eac
 - One result row per key.
 
 ## `rejects`
-Tables holding rows rejected during a load. They are used only in the record counts.
+Tables holding rows rejected during a load. They are used only in the record counts. If a rejects table does not exist yet, the entity is skipped (see [Entities whose tables do not exist yet](#entities-whose-tables-do-not-exist-yet)).
 
 ```json
 "rejects": {"stg": "STG.crm.customer_rejects", "tgt": "CNFZ.core.customer_rejects"}
@@ -221,6 +229,7 @@ Notes:
 - **Setting a length on a non-text column.** The length is checked against the text form of the value, so a decimal such as `12345678.90` with `length: 10` fails.
 - **A JSON syntax error.** One missing comma stops the whole file from loading, so validate it before a run.
 - **Case.** Entity names are case-sensitive in the `entities` widget, and a name that is not in the config is reported as a Setup failure. Column names are not case-sensitive.
+- **A misspelt table name.** It looks the same as a table that does not exist yet, so the entity is reported as `SKIPPED`, not failed. Check the `detail` of any skipped entity you expected to run.
 - **A defaulted column with no `expr`.** Rows where STG is null and TGT holds the default show up in the full row comparison.
 - **Unquoted `yes`, `no`, `on`, `off` in YAML.** YAML turns them into booleans, so write `default: "NO"` with quotes.
 
