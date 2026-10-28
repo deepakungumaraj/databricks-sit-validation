@@ -1,0 +1,24 @@
+{
+  "customer": {
+    "raw": "RAW.crm.customer",
+    "stg": "STG.crm.customer_stg",
+    "tgt": "CNFZ.core.dim_customer",
+    "filters": {"tgt": "is_current = true"},
+    "keys": {"raw": ["cust_id"], "stg": ["customer_id"], "tgt": ["customer_id"]},
+    "alt_keys": {"tgt": [["email"]]},
+    "rejects": {"stg": "STG.crm.customer_rejects"},
+    "columns": [
+      {"stg": "customer_id", "tgt": "customer_id", "type": "bigint", "nullable": false},
+      {"stg": "customer_name", "tgt": "customer_name", "type": "varchar(100)", "nullable": false,
+       "expr": "upper(trim(customer_name))"},
+      {"stg": "status", "tgt": "status", "type": "string", "default": "A", "expr": "coalesce(status, 'A')"},
+      {"stg": "credit_limit", "tgt": "credit_limit", "type": "decimal(10,2)", "agg": true}
+    ],
+    "audit_cols": ["created_ts", "updated_ts", "batch_id"],
+    "dq": [
+      {"name": "status_valid", "col": "status", "accepted_values": ["A", "I", "C"]},
+      {"name": "no_stray_spaces", "cols": ["customer_name"], "no_leading_trailing_space": true},
+      {"name": "credit_in_range", "col": "credit_limit", "range": [0, 1000000]}
+    ]
+  }
+}
