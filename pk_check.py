@@ -48,6 +48,9 @@ def check_table(target):
     """Returns (summary row, per column null rows, sample duplicate keys as (table, pandas)). Raises on bad input."""
     if not isinstance(target, dict):
         raise ValueError(f"expected an object with table and key_columns, found {target!r}")
+    unknown = set(target) - {"table", "key_columns", "filter"}
+    if unknown:
+        raise ValueError(f"unknown setting(s): {', '.join(sorted(unknown))}. Allowed: table, key_columns, filter")
     table = str(target.get("table") or "").strip()
     parts = [p.strip().strip("`") for p in table.split(".")]
     if len(parts) != 3 or not all(parts):
@@ -87,14 +90,14 @@ def check_table(target):
 
     # Unique: the combination of all key columns, over rows with no null in the key.
     non_null = df.filter(~any_null)   # not dropna: it would also drop NaN, which is a value here
-    dups = non_null.groupBy(*[F.col(q(k)) for k in keys]).agg(F.count(F.lit(1)).alias("__n")).filter(F.col("__n") > 1)
-    d = dups.agg(F.count(F.lit(1)).alias("keys"), F.coalesce(F.sum(F.col("__n") - 1), F.lit(0)).alias("extra")).first()
+    dups = non_null.groupBy(*[F.col(q(k)) for k in keys]).agg(F.count(F.lit(1)).alias("__pk_dup_rows")).filter(F.col("__pk_dup_rows") > 1)
+    d = dups.agg(F.count(F.lit(1)).alias("keys"), F.coalesce(F.sum(F.col("__pk_dup_rows") - 1), F.lit(0)).alias("extra")).first()
     dup_keys, extra_rows = int(d["keys"]), int(d["extra"])
 
     sample = pd.DataFrame()
     if dup_keys:
-        sample = (dups.orderBy(F.col("__n").desc(), *[F.col(q(k)) for k in keys]).limit(20)
-                  .select(*[F.col(q(k)).cast("string").alias(k) for k in keys], F.col("__n").alias("rows_with_this_key"))
+        sample = (dups.orderBy(F.col("__pk_dup_rows").desc(), *[F.col(q(k)) for k in keys]).limit(20)
+                  .select(*[F.col(q(k)).cast("string").alias(k) for k in keys], F.col("__pk_dup_rows").alias("rows_with_this_key"))
                   .toPandas().astype(str))
 
     summary = {"table": table, "key_columns": ", ".join(keys), "filter": flt, "rows_checked": rows,
