@@ -21,6 +21,8 @@ When STG is built by joining several RAW tables, `raw` can be a query instead of
 
 Nothing is saved to Delta tables. Results are shown in the notebook and can be written to CSV and Excel files.
 
+For a quicker check of a single table's primary key only (not null and unique, composite keys allowed), see [PK_CHECK.md](PK_CHECK.md).
+
 ## Running it
 **As a Databricks job (normal use).** Create a job with one **Notebook** task on serverless compute. Add these job parameters, whose names match the notebook's widgets:
 
