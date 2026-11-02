@@ -2,6 +2,8 @@
 
 A single Databricks notebook, `sit_validation.py` (also provided as `sit_validation.ipynb`), that runs by hand after each load and compares the RAW, STG and TGT (CNFZ) layers for the tables you list in a config file.
 
+New here? Read the [user guide](USER_GUIDE.md) for setup, running it and reading the results.
+
 Checks, in the order they appear in the results:
 - **Record Count**: RAW vs STG vs TGT, allowing for rejected rows
 - **Primary Key**: not null and unique, per layer
@@ -14,6 +16,8 @@ Checks, in the order they appear in the results:
 - **Setup**: anything that could not run (a config mistake, no access to a table, an error in one rule), and entities skipped because a table does not exist yet
 
 Each check has a status of `PASS`, `FAIL`, `WARN` (reported, never fails the run) or `SKIPPED`. An entity added to the config before its tables exist is skipped with one `SKIPPED` row that names the missing tables, and the run carries on with the next entity. See [CONFIG.md](CONFIG.md#entities-whose-tables-do-not-exist-yet).
+
+When STG is built by joining several RAW tables, `raw` can be a query instead of a table name, read from a `.sql` file you upload to the workspace. See [CONFIG.md](CONFIG.md#raw-built-from-several-tables-a-query).
 
 Nothing is saved to Delta tables. Results are shown in the notebook and can be written to CSV and Excel files.
 

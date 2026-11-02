@@ -15,6 +15,7 @@ dbutils.widgets.dropdown("fail_run_on", "setup", ["never", "setup", "any"])   # 
 ENTITIES = [e.strip() for e in dbutils.widgets.get("entities").split(",") if e.strip()]
 OUTPUT_DIR = dbutils.widgets.get("output_dir").strip()
 FAIL_RUN_ON = dbutils.widgets.get("fail_run_on").strip().lower()
+assert FAIL_RUN_ON in ("never", "setup", "any"), f"fail_run_on must be never, setup or any, found {FAIL_RUN_ON!r}"
 CONFIG_PATH = dbutils.widgets.get("config_path").strip()
 
 # COMMAND ----------
@@ -24,6 +25,11 @@ CONFIG_PATH = dbutils.widgets.get("config_path").strip()
 # Full reference: CONFIG.md
 #
 #   raw, stg, tgt   "catalog.schema.table"
+#                   raw can also be a query when STG is built by joining several RAW tables:
+#                     {"sql_file": "/Workspace/Users/<you>/sit_sql/orders.sql", "params": {"env": "dev"}}
+#                   sql_file is a SELECT (or WITH) query uploaded to the workspace or a volume; ${env} in it is
+#                   replaced by the params value. {"sql": "SELECT ..."} puts the query in the config instead.
+#                   keys.raw and filters.raw then refer to the columns the query returns.
 #   filters         optional SQL filter per layer, e.g. {"tgt": "is_current = true"} for SCD2
 #   keys            primary key columns per layer (same order, so raw[0] corresponds to stg[0] and tgt[0]);
 #                   RAW and STG values are cast to the TGT key type before they are compared
@@ -75,12 +81,14 @@ CONFIG = {
 
 import json
 import math
+import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import reduce
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType
 
 if CONFIG_PATH:
     with open(CONFIG_PATH) as f:
@@ -134,8 +142,54 @@ def full_name(fq):
     return ".".join(q(p) for p in fq.split("."))
 
 
+def raw_query(src):
+    """SQL for a RAW layer built from several tables: inline 'sql', or 'sql_file' (uploaded to the workspace or a volume)."""
+    if "sql_file" in src:
+        try:
+            with open(src["sql_file"], encoding="utf-8-sig") as f:
+                text = f.read()
+        except OSError as e:
+            raise ValueError(f"SQL file could not be opened: {e}")
+        except UnicodeDecodeError:
+            raise ValueError("SQL file is not UTF-8 text, save it as UTF-8")
+    else:
+        text = src["sql"]
+    for k, v in (src.get("params") or {}).items():
+        text = text.replace("${" + k + "}", str(v))
+    left = sorted(set(re.findall(r"\$\{\w+\}", text)))
+    if left:
+        raise ValueError(f"no value in 'params' for {left}")
+    # drop trailing blank lines, whole-line comments and semicolons (a sub-query cannot end with ";")
+    lines = text.splitlines()
+    while True:
+        while lines and (not lines[-1].strip() or lines[-1].strip().startswith("--")):
+            lines.pop()
+        if lines and lines[-1].rstrip().endswith(";"):
+            lines[-1] = lines[-1].rstrip().rstrip(";")
+            continue
+        break
+    text = "\n".join(lines)
+    head = re.sub(r"\A(?:\s+|--[^\n]*|/\*.*?\*/)+", "", text, flags=re.S)
+    if not re.match(r"(?:select|with|values|from|table)\b|\(", head, re.I):
+        raise ValueError(f"the file must hold one SELECT (or WITH ... SELECT) query but it starts with "
+                         f"{head[:40]!r}; upload a copy with only the SELECT part")
+    return text
+
+
+def source_name(v):
+    """How a layer's source is named in messages."""
+    if isinstance(v, str):
+        return v
+    return f"query in {v['sql_file']}" if "sql_file" in v else "inline query"
+
+
 def load(cfg, layer):
-    df = spark.table(full_name(cfg[layer]))
+    src = cfg[layer]
+    if isinstance(src, dict):
+        # Wrapped as a sub-query, so anything that is not a SELECT fails to parse instead of running
+        df = spark.sql(f"SELECT * FROM (\n{raw_query(src)}\n) AS raw_query")
+    else:
+        df = spark.table(full_name(src))
     flt = cfg.get("filters", {}).get(layer)
     if flt:
         df = df.filter(flt)
@@ -150,7 +204,12 @@ NO_ACCESS = re.compile(r"PERMISSION_DENIED|INSUFFICIENT_PERMISSIONS", re.I)
 
 def is_not_found(e):
     """True when the error only says a table, schema or catalog does not exist (yet). Access errors are not."""
-    return bool(NOT_FOUND.search(str(e))) and not NO_ACCESS.search(str(e))
+    msg = str(e).split("== SQL")[0]  # Spark echoes the query after this marker; its text must not count
+    return bool(NOT_FOUND.search(msg)) and not NO_ACCESS.search(msg)
+
+
+def lower_cols(df):
+    return {c.lower() for c in df.columns}
 
 
 def tgt_type(df, col):
@@ -165,8 +224,8 @@ def typed(sql_expr, dtype):
 def norm_type(t):
     t = re.sub(r"\s+", "", str(t).lower())
     t = re.sub(r"^(varchar|char)\(\d+\)$", "string", t)
-    return {"integer": "int", "long": "bigint", "short": "smallint", "byte": "tinyint",
-            "numeric": "decimal", "real": "float"}.get(t, t)
+    t = re.sub(r"^numeric", "decimal", t)
+    return {"integer": "int", "long": "bigint", "short": "smallint", "byte": "tinyint", "real": "float"}.get(t, t)
 
 
 def map_length(m):
@@ -178,6 +237,15 @@ def map_length(m):
 
 def norm_default(v):
     return None if v is None else str(v).strip().strip("'\"").lower()
+
+
+def same_default(a, b):
+    """Defaults match as text, or as numbers (so 0 matches 0.00)."""
+    x, y = norm_default(a), norm_default(b)
+    try:
+        return float(x) == float(y)
+    except (TypeError, ValueError):
+        return x == y
 
 
 def same_values(a, b):
@@ -227,14 +295,48 @@ def validate_config(cfg):
         return ["the entity settings must be an object"], warnings
     for layer in LAYERS:
         v = cfg.get(layer)
-        if not isinstance(v, str) or len(v.split(".")) != 3:
-            problems.append(f"'{layer}' must be catalog.schema.table, found {v!r}")
-    lengths = {l: len(c) for l, c in cfg.get("keys", {}).items()}
+        if layer == "raw" and isinstance(v, dict):
+            given = [k for k in ("sql", "sql_file") if k in v]
+            if len(given) != 1 or not isinstance(v[given[0]], str):
+                problems.append("'raw' as a query needs exactly one of 'sql' or 'sql_file', as text")
+            if not isinstance(v.get("params") or {}, dict):
+                problems.append("'raw' 'params' must be an object")
+            if set(v) - {"sql", "sql_file", "params"}:
+                problems.append(f"'raw' has unknown settings {sorted(set(v) - {'sql', 'sql_file', 'params'})}")
+        elif not isinstance(v, str) or len(v.split(".")) != 3:
+            problems.append(f"'{layer}' must be catalog.schema.table"
+                            f"{' (or a query with sql / sql_file)' if layer == 'raw' else ''}, found {v!r}")
+    def shape(name, ok):
+        """The setting must be an object keyed by layer, with values that pass ok(). Returns True when it does."""
+        v = cfg.get(name)
+        if v is None:
+            return False
+        if isinstance(v, dict) and set(v) <= set(LAYERS) and all(ok(x) for x in v.values()):
+            return True
+        problems.append(f"'{name}' has the wrong shape (see CONFIG.md), found {v!r}")
+        return False
+
+    def cols_ok(x):
+        return isinstance(x, list) and bool(x) and all(isinstance(c, str) for c in x)
+
+    keys_ok = shape("keys", cols_ok)
+    shape("alt_keys", lambda x: isinstance(x, list) and bool(x) and all(cols_ok(k) for k in x))
+    shape("rejects", lambda x: not x or (isinstance(x, str) and len(x.split(".")) == 3))
+    shape("filters", lambda x: isinstance(x, str))
+    lengths = {l: len(c) for l, c in cfg["keys"].items()} if keys_ok else {}
     if len(set(lengths.values())) > 1:
         problems.append(f"'keys' lists must have the same number of columns in every layer, found {lengths}")
-    for m in cfg.get("columns", []):
+    columns = cfg.get("columns", [])
+    if not isinstance(columns, list):
+        problems.append(f"'columns' must be a list, found {columns!r}")
+        columns = []
+    for m in columns:
         if not isinstance(m, dict) or not m.get("tgt"):
             problems.append(f"every entry in 'columns' needs a 'tgt', found {m!r}")
+            continue
+        for flag in ("nullable", "recon", "agg"):
+            if m.get(flag) is not None and not isinstance(m[flag], bool):
+                problems.append(f"'{flag}' for {m['tgt']!r} must be true or false, not text, found {m[flag]!r}")
     unknown = sorted(set(cfg) - KNOWN_SETTINGS)
     if unknown:
         warnings.append(f"unknown settings ignored: {unknown}")
@@ -284,10 +386,14 @@ def check_alternate_key(entity, cfg, ctx):
 
 
 def check_full_row_stg_vs_tgt(entity, cfg, ctx):
-    cols = [m for m in cfg.get("columns", []) if (m.get("stg") or m.get("expr")) and m.get("recon", True)]
+    tgt = ctx["df"]["tgt"]
+    tgt_cols, stg_cols = lower_cols(tgt), lower_cols(ctx["df"]["stg"])
+    # a column missing from a layer is already reported by Columns present, so it is left out here
+    cols = [m for m in cfg.get("columns", [])
+            if (m.get("stg") or m.get("expr")) and m.get("recon", True) and m["tgt"].lower() in tgt_cols
+            and (m.get("expr") or m["stg"].lower() in stg_cols)]
     if not cols:
         return
-    tgt = ctx["df"]["tgt"]
     names = [m["tgt"] for m in cols]
     s = ctx["df"]["stg"].select(*[
         typed(m["expr"] if m.get("expr") else q(m["stg"]), tgt_type(tgt, m["tgt"])).cast("string").alias(m["tgt"])
@@ -326,20 +432,30 @@ def check_key_raw_vs_tgt(entity, cfg, ctx):
 
 
 def check_aggregates(entity, cfg, ctx):
-    cols = [m for m in cfg.get("columns", []) if m.get("agg")]
+    tgt = ctx["df"]["tgt"]
+    tgt_cols, stg_cols = lower_cols(tgt), lower_cols(ctx["df"]["stg"])
+    cols = [m for m in cfg.get("columns", []) if m.get("agg") and m["tgt"].lower() in tgt_cols
+            and (m.get("expr") or (m.get("stg") and m["stg"].lower() in stg_cols))]
     if not cols:
         return
-    tgt = ctx["df"]["tgt"]
-    bad = []
+    bad, done = [], 0
     for m in cols:
         with guard(entity, "Reconciliation", f"aggregate {m['tgt']}"):
-            s = typed(m["expr"] if m.get("expr") else q(m["stg"]), tgt_type(tgt, m["tgt"]))
+            dtype = tgt_type(tgt, m["tgt"])
+            s = typed(m["expr"] if m.get("expr") else q(m["stg"]), dtype)
             t = F.col(q(m["tgt"]))
-            a = ctx["df"]["stg"].agg(F.sum(s), F.min(s), F.max(s), F.count(s)).first()
-            b = tgt.agg(F.sum(t), F.min(t), F.max(t), F.count(t)).first()
+            numeric = isinstance(dtype, NumericType)   # a sum only makes sense for numbers
+
+            def aggs(c):
+                return [F.sum(c) if numeric else F.lit(None), F.min(c), F.max(c), F.count(c)]
+
+            a = ctx["df"]["stg"].agg(*aggs(s)).first()
+            b = tgt.agg(*aggs(t)).first()
             if not same_values(tuple(a), tuple(b)):
                 bad.append(f"{m['tgt']}: STG (sum, min, max, count) {tuple(a)} vs TGT {tuple(b)}")
-    record(entity, "Reconciliation", "Aggregates: STG vs TGT", not bad, detail="; ".join(bad))
+            done += 1
+    if done:
+        record(entity, "Reconciliation", "Aggregates: STG vs TGT", not bad, detail="; ".join(bad))
 
 
 def check_column_presence(entity, cfg, ctx):
@@ -373,16 +489,17 @@ def check_data_types(entity, cfg, ctx):
 
 def check_lengths(entity, cfg, ctx):
     bad, undeclared, data_cols = [], [], []
+    tgt_cols = lower_cols(ctx["df"]["tgt"])
     for m in cfg.get("columns", []):
         want = map_length(m)
         i = ctx["info"].get(m["tgt"].lower())
-        if want is None or not i:
+        if want is None or m["tgt"].lower() not in tgt_cols:
             continue
-        if i["length"] is None:
+        if i and i["length"] is None:
             undeclared.append(m["tgt"])
-        elif i["length"] != want:
+        elif i and i["length"] != want:
             bad.append(f"{m['tgt']}: expected {want}, declared {i['length']}")
-        data_cols.append((m["tgt"], want))
+        data_cols.append((m["tgt"], want))   # the data is checked even when the catalog has nothing to compare
     if data_cols:
         row = ctx["df"]["tgt"].agg(*[F.max(F.length(F.col(q(c)))).alias(c) for c, _ in data_cols]).first()
         for c, want in data_cols:
@@ -395,21 +512,24 @@ def check_lengths(entity, cfg, ctx):
 
 
 def check_defaults(entity, cfg, ctx):
-    cols = [m for m in cfg.get("columns", []) if m.get("default") is not None]
+    tgt = ctx["df"]["tgt"]
+    tgt_cols, stg_cols = lower_cols(tgt), lower_cols(ctx["df"]["stg"])
+    cols = [m for m in cfg.get("columns", []) if m.get("default") is not None and m["tgt"].lower() in tgt_cols]
     if not cols:
         return
-    tgt = ctx["df"]["tgt"]
-    bad_decl, bad_data = [], []
+    bad_decl, bad_data, done = [], [], 0
     keys = cfg.get("keys", {})
     can_join = bool(keys.get("stg") and keys.get("tgt"))
     for m in cols:
         with guard(entity, "Default values", m["tgt"]):
             i = ctx["info"].get(m["tgt"].lower())
-            if i and i["default"] is not None and norm_default(i["default"]) != norm_default(m["default"]):
+            if i and i["default"] is not None and not same_default(i["default"], m["default"]):
                 bad_decl.append(f"{m['tgt']}: expected {m['default']}, declared {i['default']}")
             want = m["default"].strip("'\"") if isinstance(m["default"], str) else m["default"]
             dtype = tgt_type(tgt, m["tgt"])
-            if m.get("stg") and can_join:
+            # the default as a SQL literal, cast with try_cast so a default that does not fit the type is a finding, not an error
+            literal = "'" + str(want).replace("\\", "\\\\").replace("'", "''") + "'"
+            if m.get("stg") and can_join and m["stg"].lower() in stg_cols:
                 alias = [f"k{n}" for n in range(len(keys["stg"]))]
                 s = ctx["df"]["stg"].select(
                     *[typed(q(sk), tgt_type(tgt, tk)).alias(a) for sk, tk, a in zip(keys["stg"], keys["tgt"], alias)],
@@ -417,30 +537,36 @@ def check_defaults(entity, cfg, ctx):
                 t = tgt.select(*[F.col(q(tk)).alias(a) for tk, a in zip(keys["tgt"], alias)],
                                F.col(q(m["tgt"])).alias("tv"))
                 n = s.join(t, alias).filter(
-                    F.col("sv").isNull() & ~F.col("tv").eqNullSafe(F.lit(want).cast(dtype))).count()
+                    F.col("sv").isNull() & ~F.col("tv").eqNullSafe(typed(literal, dtype))).count()
                 if n:
                     bad_data.append(f"{m['tgt']}: {n} rows with a null source value do not hold the default '{want}'")
             else:
                 n = tgt.filter(F.col(q(m["tgt"])).isNull()).count()
                 if n:
                     bad_data.append(f"{m['tgt']}: {n} null values in a column with a default")
-    record(entity, "Nullability and Defaults", "Default values", not bad_decl and not bad_data,
-           detail="; ".join(bad_decl + bad_data))
+            done += 1
+    if done:
+        record(entity, "Nullability and Defaults", "Default values", not bad_decl and not bad_data,
+               detail="; ".join(bad_decl + bad_data))
 
 
 def check_nullability(entity, cfg, ctx):
     cols = [m for m in cfg.get("columns", []) if m.get("nullable") is not None]
     if not cols:
         return
-    bad = []
+    bad, compared = [], 0
     for m in cols:
         i = ctx["info"].get(m["tgt"].lower())
-        if i and i["nullable"] != bool(m["nullable"]):
-            bad.append(f"{m['tgt']}: mapping says {'nullable' if m['nullable'] else 'NOT NULL'}, "
-                       f"catalog declares {'nullable' if i['nullable'] else 'NOT NULL'}")
-    record(entity, "Nullability and Defaults", "Declared nullability vs mapping", "WARN" if bad else True,
-           detail="; ".join(bad))
-    mandatory = [m["tgt"] for m in cols if not m["nullable"]]
+        if i:
+            compared += 1
+            if i["nullable"] != m["nullable"]:
+                bad.append(f"{m['tgt']}: mapping says {'nullable' if m['nullable'] else 'NOT NULL'}, "
+                           f"catalog declares {'nullable' if i['nullable'] else 'NOT NULL'}")
+    if compared:
+        record(entity, "Nullability and Defaults", "Declared nullability vs mapping", "WARN" if bad else True,
+               detail="; ".join(bad))
+    tgt_cols = lower_cols(ctx["df"]["tgt"])
+    mandatory = [m["tgt"] for m in cols if not m["nullable"] and m["tgt"].lower() in tgt_cols]
     if mandatory:
         row = ctx["df"]["tgt"].agg(*[F.sum(F.col(q(c)).isNull().cast("int")).alias(c) for c in mandatory]).first()
         nulls = [f"{c}: {row[c]} nulls" for c in mandatory if row[c]]
@@ -456,7 +582,9 @@ def check_data_quality(entity, cfg, ctx):
             if "sql" in rule:
                 view = f"_sit_{layer}"
                 df.createOrReplaceTempView(view)
-                bad = spark.sql(rule["sql"].replace("{t}", view))
+                body = re.sub(r"[;\s]+$", "", rule["sql"].replace("{t}", view))
+                # wrapped as a sub-query, so anything that is not a SELECT fails to parse instead of running
+                bad = spark.sql(f"SELECT * FROM (\n{body}\n) AS dq_rows")
             elif "accepted_values" in rule:
                 c = F.col(q(rule["col"]))
                 bad = df.filter(c.isNotNull() & ~c.isin(rule["accepted_values"]))
@@ -473,7 +601,7 @@ def check_data_quality(entity, cfg, ctx):
             elif "compare" in rule:
                 a, op, b = rule["compare"]
                 if op not in ("<", "<=", ">", ">=", "=", "<>"):
-                    record(entity, "Data Quality", name, False, detail=f"unknown operator {op}")
+                    record(entity, "Setup", f"Error in Data Quality: {name}", False, detail=f"unknown operator {op}")
                     continue
                 ca, cb = F.col(q(a)), F.col(q(b))
                 viol = ca.isNotNull() & cb.isNotNull() & ~F.expr(f"{q(a)} {op} {q(b)}")
@@ -482,10 +610,11 @@ def check_data_quality(entity, cfg, ctx):
                 bad = df.filter(viol)
             elif "range" in rule:
                 c, (lo, hi) = F.col(q(rule["col"])), rule["range"]
-                bad = df.filter(c.isNotNull() & ((c < lo) | (c > hi)))
+                out = ([c < lo] if lo is not None else []) + ([c > hi] if hi is not None else [])   # null = no bound
+                bad = df.filter(c.isNotNull() & reduce(lambda x, y: x | y, out)) if out else df.limit(0)
             else:
-                record(entity, "Data Quality", name, False, detail="rule needs sql, accepted_values, regex, "
-                       "no_leading_trailing_space, not_empty, compare or range")
+                record(entity, "Setup", f"Error in Data Quality: {name}", False, detail="rule needs sql, "
+                       "accepted_values, regex, no_leading_trailing_space, not_empty, compare or range")
                 continue
             cnt = bad.count()
             allowed = rule.get("max_violations", 0)
@@ -527,20 +656,20 @@ CHECKS = [check_record_count, check_primary_key, check_alternate_key, check_full
 to_run = ENTITIES or list(CONFIG)
 assert to_run, "Add an entity to CONFIG (or set config_path), or fill the 'entities' widget"
 
-for entity in to_run:
+def run_entity(entity):
     cfg = CONFIG.get(entity)
     if cfg is None:
         record(entity, "Setup", "Unknown entity", False, detail=f"not in the config; available: {sorted(CONFIG)}")
-        continue
+        return
     problems, warnings = validate_config(cfg)
     for w in warnings:
         record(entity, "Setup", "Config settings", "WARN", detail=w)
     if problems:
         record(entity, "Setup", "Config settings", False, detail="; ".join(problems))
-        continue
+        return
     # A table that does not exist yet (entity added before its tables) skips the entity; any other error fails it.
     dfs, found, missing, errors = {}, [], [], []
-    tables = [(l, l.upper(), cfg[l]) for l in LAYERS]
+    tables = [(l, l.upper(), source_name(cfg[l])) for l in LAYERS]
     tables += [(None, f"{l.upper()} rejects", t) for l, t in cfg.get("rejects", {}).items() if t]
     for layer, label, name in tables:
         try:
@@ -551,17 +680,28 @@ for entity in to_run:
             found.append(label)
         except Exception as e:  # table missing, no access, or a bad filter
             if is_not_found(e):
-                missing.append(f"{label} {name}")
+                # for a query the error names the missing table
+                missing.append(f"{label} {name}" + (f" ({str(e)[:200]})" if isinstance(cfg.get(layer), dict) else ""))
             else:
                 errors.append(f"{label} {name}: {str(e)[:300]}")
     gone = [f"not found: {', '.join(missing)}"] if missing else []
     if errors:
         record(entity, "Setup", "Load tables", False, detail="; ".join(errors + gone))
-        continue
+        return
     if missing:
         record(entity, "Setup", "Skipped: tables not found", "SKIP",
                detail=f"{gone[0]}; found: {', '.join(found) or 'none'}; no checks were run for this entity")
-        continue
+        return
+    if isinstance(cfg["raw"], dict):
+        # an uploaded file can go stale, so show which file ran and when it was last changed
+        note = "inline query from the config"
+        if "sql_file" in cfg["raw"]:
+            try:
+                changed = datetime.fromtimestamp(os.path.getmtime(cfg["raw"]["sql_file"]), timezone.utc)
+                note = f"{cfg['raw']['sql_file']} (last changed {changed:%Y-%m-%d %H:%M} UTC)"
+            except OSError:
+                note = f"{cfg['raw']['sql_file']} (last changed unknown)"
+        record(entity, "Setup", "RAW source", True, detail=note)
     try:
         info = table_info(cfg["tgt"])
         info_note = "no rows in information_schema.columns for TGT" if not info else ""
@@ -576,6 +716,13 @@ for entity in to_run:
             check(entity, cfg, ctx)
         except Exception as e:
             record(entity, "Setup", "Error in " + check.__name__[6:].replace("_", " "), False, detail=e)
+
+
+for entity in to_run:
+    try:
+        run_entity(entity)
+    except Exception as e:  # whatever goes wrong in one entity must not stop the others or the results below
+        record(entity, "Setup", "Unexpected error", False, detail=f"ERROR: {e}")
 
 # COMMAND ----------
 
@@ -631,7 +778,6 @@ for entity, check, pdf in samples:
 export_note = ""
 if OUTPUT_DIR:
     try:
-        import os
         import shutil
         import tempfile
         import pandas as pd
