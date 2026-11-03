@@ -1,0 +1,11 @@
+{% import 'strategies/' ~ watermark_strategy ~ '.j2' as wm %}
+-- Incremental load: upsert the slice
+MERGE INTO {{ tgt_fqn }} AS t
+USING (
+  SELECT {{ col_select }}
+    FROM {{ src_fqn }}
+   WHERE {{ wm.slice(watermark_column) }}
+) AS s
+ON {{ pk_join }}
+WHEN MATCHED THEN UPDATE SET {{ update_set }}
+WHEN NOT MATCHED THEN INSERT {{ insert_clause }};

@@ -1,0 +1,4 @@
+{# Watermark strategy: timestamp column. Slice = (last watermark, new high watermark]. #}
+{% macro slice(col) -%}
+{{ col }} > coalesce(CAST(v_last_wm AS TIMESTAMP), TIMESTAMP'1900-01-01') AND {{ col }} <= CAST(v_new_wm AS TIMESTAMP)
+{%- endmacro %}

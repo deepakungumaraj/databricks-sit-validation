@@ -1,0 +1,18 @@
+-- GENERATED FILE: one-time setup of control and watermark tables
+CREATE SCHEMA IF NOT EXISTS {{ catalog }}.{{ etl_schema }};
+
+CREATE TABLE IF NOT EXISTS {{ control_table }} (
+  run_id        STRING,
+  table_name    STRING,
+  status        STRING,      -- OPEN | CLOSED | FAILED
+  start_time    TIMESTAMP,
+  end_time      TIMESTAMP,
+  rows_affected BIGINT,
+  error_message STRING
+);
+
+CREATE TABLE IF NOT EXISTS {{ watermark_table }} (
+  table_name   STRING,
+  last_value   STRING,       -- watermark stored as string; strategy casts it
+  updated_time TIMESTAMP
+);

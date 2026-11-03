@@ -1,0 +1,5 @@
+{% import 'strategies/' ~ watermark_strategy ~ '.j2' as wm %}
+-- Read last watermark, fix the new high watermark up front so the load is a stable slice
+SET VAR v_last_wm = (SELECT last_value FROM {{ watermark_table }} WHERE table_name = '{{ name }}');
+SET VAR v_new_wm  = (SELECT CAST(max({{ watermark_column }}) AS STRING) FROM {{ src_fqn }});
+SET VAR v_rows    = (SELECT count(*) FROM {{ src_fqn }} WHERE {{ wm.slice(watermark_column) }});

@@ -1,0 +1,3 @@
+-- Open control record
+INSERT INTO {{ control_table }} (run_id, table_name, status, start_time)
+VALUES (v_run_id, '{{ name }}', 'OPEN', current_timestamp());

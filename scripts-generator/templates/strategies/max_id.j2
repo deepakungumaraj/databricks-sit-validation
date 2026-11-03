@@ -1,0 +1,4 @@
+{# Watermark strategy: monotonically increasing numeric column. #}
+{% macro slice(col) -%}
+{{ col }} > coalesce(CAST(v_last_wm AS BIGINT), -9223372036854775807) AND {{ col }} <= CAST(v_new_wm AS BIGINT)
+{%- endmacro %}

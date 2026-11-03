@@ -1,0 +1,8 @@
+{% import 'strategies/' ~ watermark_strategy ~ '.j2' as wm %}
+-- Validate: every row in the loaded slice matches the target (hash of all columns)
+-- Assumes source and target have identical column order.
+IF (SELECT count(*)
+      FROM (SELECT * FROM {{ src_fqn }} WHERE {{ wm.slice(watermark_column) }}) AS s
+      LEFT ANTI JOIN {{ tgt_fqn }} AS t ON {{ pk_join }} AND xxhash64(s.*) = xxhash64(t.*)) > 0 THEN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Validation failed for {{ name }}: slice rows differ from target';
+END IF;

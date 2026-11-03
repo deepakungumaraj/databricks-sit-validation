@@ -1,0 +1,9 @@
+-- Record watermark
+IF v_new_wm IS NOT NULL THEN
+  MERGE INTO {{ watermark_table }} AS t
+  USING (SELECT '{{ name }}' AS table_name, v_new_wm AS last_value) AS s
+  ON t.table_name = s.table_name
+  WHEN MATCHED THEN UPDATE SET last_value = s.last_value, updated_time = current_timestamp()
+  WHEN NOT MATCHED THEN INSERT (table_name, last_value, updated_time)
+       VALUES (s.table_name, s.last_value, current_timestamp());
+END IF;

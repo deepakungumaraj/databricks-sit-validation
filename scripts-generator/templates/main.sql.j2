@@ -1,0 +1,21 @@
+-- GENERATED FILE: do not edit. Source: config/tables.yaml
+-- Table: {{ tgt_fqn }}  (watermark={{ watermark_strategy }})
+-- Steps: {{ step_names | join(' > ') }}
+BEGIN
+  DECLARE v_run_id STRING DEFAULT uuid();
+  DECLARE v_last_wm STRING;
+  DECLARE v_new_wm STRING;
+  DECLARE v_rows BIGINT DEFAULT 0;
+  DECLARE v_err STRING;
+
+  DECLARE EXIT HANDLER FOR SQLEXCEPTION
+  BEGIN
+    GET DIAGNOSTICS CONDITION 1 v_err = MESSAGE_TEXT;
+    UPDATE {{ control_table }}
+       SET status = 'FAILED', end_time = current_timestamp(), error_message = v_err
+     WHERE run_id = v_run_id;
+    RESIGNAL;
+  END;
+
+{{ body }}
+END;

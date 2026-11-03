@@ -1,0 +1,4 @@
+-- Close control record
+UPDATE {{ control_table }}
+   SET status = 'CLOSED', end_time = current_timestamp(), rows_affected = v_rows
+ WHERE run_id = v_run_id;

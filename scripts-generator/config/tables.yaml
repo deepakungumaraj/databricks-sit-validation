@@ -1,0 +1,86 @@
+# One entry per table. Anything not set falls back to `defaults`.
+# All names below are PLACEHOLDERS: replace catalog/schemas, table names, keys, watermark columns.
+defaults:
+  catalog: my_catalog
+  source_schema: bronze
+  target_schema: silver
+  etl_schema: etl
+  control_table_name: load_control
+  watermark_table_name: watermark
+  watermark_strategy: max_ts          # templates/strategies/<name>.j2  (max_ts | max_id)
+  steps:                              # ordered; the same list is used for every table unless overridden
+    - open_control
+    - capture_watermark
+    - load_merge
+    - validate                        # variant picked below
+    - record_watermark
+    - close_control
+  variants:
+    validate: keys_present            # keys_present | row_hash | none
+  params: {}                          # free-form values for your own templates / inline steps
+
+tables:
+  # Default behaviour: timestamp watermark, all columns (schemas match)
+  - name: table_01
+    pk: [id]
+    watermark_column: modified_ts
+
+  # Numeric watermark + hash validation
+  - name: table_02
+    pk: [id]
+    watermark_strategy: max_id
+    watermark_column: row_seq
+    variants: {validate: row_hash}
+
+  # Composite key, explicit column list, source table has a different name, no validation
+  - name: table_03
+    pk: [order_id, line_no]
+    source_name: src_table_03
+    watermark_column: modified_ts
+    columns: [order_id, line_no, qty, price, modified_ts]
+    variants: {validate: none}
+
+  # Different step sequence: inline custom SQL inserted before closing
+  - name: table_04
+    pk: [id]
+    watermark_column: modified_ts
+    steps:
+      - open_control
+      - capture_watermark
+      - load_merge
+      - validate
+      - {label: post_load_placeholder, sql: "-- PLACEHOLDER: custom statement for {{ name }}, e.g. OPTIMIZE {{ tgt_fqn }};"}
+      - record_watermark
+      - close_control
+
+  # table_05 .. table_34: placeholders, all defaults. Replace names, keys, watermark columns.
+  - {name: table_05, pk: [id], watermark_column: modified_ts}
+  - {name: table_06, pk: [id], watermark_column: modified_ts}
+  - {name: table_07, pk: [id], watermark_column: modified_ts}
+  - {name: table_08, pk: [id], watermark_column: modified_ts}
+  - {name: table_09, pk: [id], watermark_column: modified_ts}
+  - {name: table_10, pk: [id], watermark_column: modified_ts}
+  - {name: table_11, pk: [id], watermark_column: modified_ts}
+  - {name: table_12, pk: [id], watermark_column: modified_ts}
+  - {name: table_13, pk: [id], watermark_column: modified_ts}
+  - {name: table_14, pk: [id], watermark_column: modified_ts}
+  - {name: table_15, pk: [id], watermark_column: modified_ts}
+  - {name: table_16, pk: [id], watermark_column: modified_ts}
+  - {name: table_17, pk: [id], watermark_column: modified_ts}
+  - {name: table_18, pk: [id], watermark_column: modified_ts}
+  - {name: table_19, pk: [id], watermark_column: modified_ts}
+  - {name: table_20, pk: [id], watermark_column: modified_ts}
+  - {name: table_21, pk: [id], watermark_column: modified_ts}
+  - {name: table_22, pk: [id], watermark_column: modified_ts}
+  - {name: table_23, pk: [id], watermark_column: modified_ts}
+  - {name: table_24, pk: [id], watermark_column: modified_ts}
+  - {name: table_25, pk: [id], watermark_column: modified_ts}
+  - {name: table_26, pk: [id], watermark_column: modified_ts}
+  - {name: table_27, pk: [id], watermark_column: modified_ts}
+  - {name: table_28, pk: [id], watermark_column: modified_ts}
+  - {name: table_29, pk: [id], watermark_column: modified_ts}
+  - {name: table_30, pk: [id], watermark_column: modified_ts}
+  - {name: table_31, pk: [id], watermark_column: modified_ts}
+  - {name: table_32, pk: [id], watermark_column: modified_ts}
+  - {name: table_33, pk: [id], watermark_column: modified_ts}
+  - {name: table_34, pk: [id], watermark_column: modified_ts}

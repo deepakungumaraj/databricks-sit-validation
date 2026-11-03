@@ -1,0 +1,7 @@
+{% import 'strategies/' ~ watermark_strategy ~ '.j2' as wm %}
+-- Validate: every key in the loaded slice exists in the target
+IF (SELECT count(*)
+      FROM (SELECT * FROM {{ src_fqn }} WHERE {{ wm.slice(watermark_column) }}) AS s
+      LEFT ANTI JOIN {{ tgt_fqn }} AS t ON {{ pk_join }}) > 0 THEN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Validation failed for {{ name }}: slice keys missing in target';
+END IF;
